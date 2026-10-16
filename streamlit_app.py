@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-안건제안서 생성 보조도구
-경상남도 학생의회 · <서식 2> 안건제안서(교육지원청용)
+학생의회 AI 도우미 (Streamlit 한 파일 앱, 페이지 2개)
+  1) 통학로 개선 추가 제안 — 합천학생의회 제2차 정례회 → 합천군청 [군민의소리]           (첫 화면)
+  2) 안건제안서 생성 보조도구 — 경상남도 학생의회 · <서식 2> 안건제안서(교육지원청용) + 발표문   (주소 끝에 /proposal)
 
 학생이 '문제 상황'과 '해결책'을 쓰면 생성형 AI가 새 양식의 칸을 채운 초안을 만들고,
 학생이 확인·수정한 뒤 한글(.hwpx) 양식 그대로 내려받는다.
@@ -16,17 +17,20 @@
 """
 
 import base64
+import hashlib
 import html
 import io
 import json
 import os
 import re
+import tempfile
 import time
 import zipfile
 from datetime import datetime
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ─────────────────────────────────────────────────────────────
 # 기본 설정
@@ -198,11 +202,16 @@ def _post(url, headers, body):
     raise AIError(f"AI 요청이 실패했어요(오류 {r.status_code}). 잠시 후 다시 눌러 주세요.", "other")
 
 
-def _call_gemini(key, model, system, user):
+def _b64(data):
+    return base64.b64encode(data).decode("ascii")
+
+
+def _call_gemini(key, model, system, user, images=None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    parts = [{"text": user}] + [{"inlineData": {"mimeType": m, "data": _b64(b)}} for m, b in (images or [])]
     body = {
         "systemInstruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
     data = _post(url, {"x-goog-api-key": key, "Content-Type": "application/json"}, body)
@@ -216,10 +225,14 @@ def _call_gemini(key, model, system, user):
     return text
 
 
-def _call_openai(key, model, system, user):
+def _call_openai(key, model, system, user, images=None):
+    content = user
+    if images:
+        content = [{"type": "text", "text": user}] + [
+            {"type": "image_url", "image_url": {"url": f"data:{m};base64,{_b64(b)}"}} for m, b in images]
     body = {
         "model": model,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
         "response_format": {"type": "json_object"},
     }
     data = _post("https://api.openai.com/v1/chat/completions",
@@ -230,9 +243,13 @@ def _call_openai(key, model, system, user):
         raise AIError("AI 답변을 읽지 못했어요. 다시 눌러 주세요.", "parse")
 
 
-def _call_anthropic(key, model, system, user):
+def _call_anthropic(key, model, system, user, images=None):
+    content = user
+    if images:
+        content = [{"type": "image", "source": {"type": "base64", "media_type": m, "data": _b64(b)}}
+                   for m, b in images] + [{"type": "text", "text": user}]
     body = {"model": model, "max_tokens": 4000, "system": system,
-            "messages": [{"role": "user", "content": user}]}
+            "messages": [{"role": "user", "content": content}]}
     data = _post("https://api.anthropic.com/v1/messages",
                  {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}, body)
     return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
@@ -260,7 +277,7 @@ def parse_json_loose(text):
     raise AIError("AI 답변을 읽지 못했어요. 다시 눌러 주세요.", "parse")
 
 
-def ask_ai(system, user):
+def ask_ai(system, user, images=None):
     """AI에게 묻고 JSON(dict)을 돌려준다. 모델이 없거나 붐비면 다음 모델로 넘어간다."""
     prov, key, forced_model = detect_provider()
     if not prov:
@@ -271,7 +288,7 @@ def ask_ai(system, user):
     for attempt in range(2):
         for m in list(models):
             try:
-                return parse_json_loose(caller(key, m, system, user)), prov, m
+                return parse_json_loose(caller(key, m, system, user, images)), prov, m
             except AIError as e:
                 last = e
                 if e.kind == "notfound":
@@ -947,11 +964,7 @@ def render_speech_section(doc, meta, n_ph):
                        mime="text/plain", key="ap_sp_dl")
 
 
-def main():
-    try:
-        st.set_page_config(page_title="안건제안서 생성 보조도구", page_icon="📝", layout="centered")
-    except Exception:
-        pass
+def proposal_page():
     st.markdown(CSS, unsafe_allow_html=True)
 
     ss = st.session_state
@@ -1123,6 +1136,834 @@ def main():
         else:
             st.write("연결된 AI 키가 없어요.")
             st.markdown(SETUP_HELP)
+
+
+# ═════════════════════════════════════════════════════════════
+# 🚸 통학로 개선 추가 제안 (합천학생의회 제2차 정례회 → 합천군청 [군민의소리])
+# ═════════════════════════════════════════════════════════════
+HAPCHEON_TOWNS = [
+    "합천읍", "봉산면", "묘산면", "가야면", "야로면", "율곡면", "초계면", "쌍책면", "덕곡면",
+    "청덕면", "적중면", "대양면", "쌍백면", "삼가면", "가회면", "대병면", "용주면",
+]
+RD_PLACE_TYPES = ["학교 정문·후문 앞", "횡단보도", "교차로·삼거리", "인도 없는 도로", "버스 승강장",
+                  "마을 안길", "다리·굴다리", "상가·주차장 앞"]
+RD_HAZARDS = ["인도가 없거나 좁음", "과속 차량", "등교 시간 차량 집중", "횡단보도·신호등 없음",
+              "가로등이 없어 어두움", "CCTV 없음", "불법 주정차로 시야 가림", "승강장 비가림 시설 없음",
+              "도로 파손·물웅덩이", "대형 화물차 통행"]
+RD_TIMES = ["등교 시간", "하교 시간", "비 오는 날", "겨울철 어두운 시간", "주말·방학"]
+RD_REQUESTS = ["보도(인도) 설치·확장", "횡단보도 설치", "신호등 설치", "과속방지턱 설치", "옐로카펫·노란 신호등",
+               "가로등 설치", "CCTV 설치", "통학버스 승강장 정비(비가림)", "보행 안전 울타리 설치",
+               "불법 주정차 단속", "어린이보호구역 지정·확대", "교통안전 지도 인력 배치"]
+RD_PRIORITY = ["매우 시급", "시급", "보통"]
+RD_LIST = ["situation", "requests", "evidence", "photo_notes"]
+RD_TEXT = ["title", "place", "priority", "priority_reason", "petition", "speech", "summary_line"]
+RD_MAX_PHOTOS = 3
+
+RD_EXAMPLE = {
+    "rd_in_school": "합천○○초등학교",
+    "rd_in_town": "합천읍",
+    "rd_in_spot": "학교 정문 앞 삼거리 횡단보도 주변",
+    "rd_in_range": "정문 ~ ○○마을 입구 약 300m 구간",
+    "rd_in_types": ["학교 정문·후문 앞", "교차로·삼거리", "인도 없는 도로"],
+    "rd_in_hazards": ["인도가 없거나 좁음", "과속 차량", "등교 시간 차량 집중"],
+    "rd_in_times": ["등교 시간", "비 오는 날"],
+    "rd_in_detail": "정문 앞 삼거리부터 마을 입구까지 인도가 없어서 차도 가장자리로 걸어야 해요. "
+                    "아침에는 학부모 차와 트럭이 한꺼번에 몰리고, 삼거리에서 차가 빠르게 돌아 나와서 깜짝 놀란 적이 많아요. "
+                    "비 오는 날에는 우산 때문에 차가 잘 안 보여요.",
+    "rd_in_requests": ["보도(인도) 설치·확장", "과속방지턱 설치", "옐로카펫·노란 신호등"],
+    "rd_in_req_detail": "삼거리 횡단보도 앞에 옐로카펫과 과속방지턱을 설치하고, 정문부터 마을 입구까지 인도를 만들어 주세요.",
+    "rd_in_users": "",
+    "rd_in_survey": "",
+    "rd_in_incident": "등교 시간에 학생 옆으로 트럭이 아슬아슬하게 지나간 일이 있었어요.",
+}
+
+RD_SHAPE = """{
+  "status": "ok",
+  "message": "",
+  "title": "건의 제목",
+  "place": "장소 한 줄 정리",
+  "situation": ["위험·불편 상황 항목"],
+  "requests": ["요구 내용 항목"],
+  "evidence": ["근거 항목"],
+  "priority": "매우 시급 | 시급 | 보통",
+  "priority_reason": "우선순위 이유 한 문장",
+  "photo_notes": ["사진·그림에서 확인한 내용"],
+  "privacy_warnings": ["개인정보가 보이는 사진과 내용"],
+  "petition": "군민의소리 게시판에 올릴 건의문 전문",
+  "speech": "정례회 자유발언(30초)",
+  "summary_line": "서기용 한 줄 요약",
+  "tips": ["학생에게 주는 조언"]
+}"""
+
+
+def road_system_prompt():
+    return f"""너는 합천학생의회 학생의원들이 합천군청 누리집 [군민의소리] 게시판에 올릴 「통학로 개선 추가 제안」을 쓰도록 돕는 도우미다.
+
+[배경]
+제1회 정례회 안건 '합천지역 통학로 개선'을 의장 명의로 [군민의소리]에 건의했고, 군청은 "통학로 개선에 관해 구체적인 장소 및 요구 내용을 추가로 올려 주면 고려하겠다"고 답했다.
+그래서 이번 제안은 '어디가(장소), 어떻게 불편하고(위험·불편 상황), 무엇을 바꿔 달라는지(요구 내용)'가 분명해야 하고,
+'장소 – 위험·불편 상황 – 요구 내용 – 근거 – 우선순위' 순서로 정리한다.
+
+[반드시 지킬 원칙]
+1. 학생이 쓴 장소·상황·요구의 핵심은 바꾸지 말고, 담당 공무원이 바로 현장을 찾아가 검토할 수 있도록 구체적으로 다듬는다.
+2. 사실을 지어내지 않는다. 학생이 주지 않은 학생 수·설문 결과·사고 건수·차량 속도·거리·도로 이름·지번은 만들지 않고, 학생이 조사해서 채울 빈칸을 【 】로 남긴다. 예) 【이 길을 이용하는 학생 수: 약 ○명】. 빈칸은 전체 2~5개.
+3. 첨부한 사진·그림이 있으면 직접 보고 확인되는 것만 photo_notes에 쓴다(예: '사진 1: 도로에 인도와 차도의 구분이 없음'). 보이지 않는 것은 추측하지 않는다. 확인한 내용은 evidence에도 '현장 사진 1: …'처럼 넣는다. 그림은 학생이 그린 약도이므로 '학생이 그린 약도에 따르면 …'으로 쓴다.
+4. 사진에 사람 얼굴, 자동차 번호판, 집 주소·문패, 이름표처럼 개인정보가 보이면 privacy_warnings에 '사진 1: 사람 얼굴이 보임'처럼 쓴다. 없으면 빈 목록.
+5. 요구 내용(requests)은 실제 시설·조치 이름으로, 어디에 무엇을 해 달라는지 드러나게 쓴다(예: '삼거리 횡단보도 앞 옐로카펫 및 노란 신호등 설치').
+6. 우선순위(priority)는 학생이 고른 값을 그대로 쓰고, priority_reason에 근거를 들어 한 문장으로 이유를 쓴다.
+7. situation·requests·evidence 항목은 개조식('~함', '~임', '~필요함')으로 1문장씩 짧게 쓴다.
+8. 건의문(petition)은 합천군청 담당자에게 보내는 정중한 존댓말('~습니다')로, 합천학생의회 명의로 쓴다. 순서: 인사와 소개(합천학생의회, 〔학교〕 학생들의 제안임) → 지난 건의에 대한 군청 답변에 감사 → 장소 → 위험·불편 상황 → 요구 내용 → 근거(사진 첨부 언급은 사진이 있을 때만) → 검토 부탁과 감사. 500~800자, 단락은 빈 줄로 구분. 〔학교〕는 글자 그대로 둔다.
+9. speech는 정례회 자유발언 시간에 말할 30초(150자 안팎) 발언으로, '의장!'으로 시작하고 장소·문제·요구를 또렷하게 말한다.
+10. summary_line은 서기가 목록으로 모을 한 줄로, '장소 – 위험·불편 상황 – 요구 내용 – 근거 – 우선순위' 형식이다.
+11. tips에는 제안을 더 탄탄하게 만들 방법 2~3개를 학생에게 말하듯 친근한 존댓말('~해 보세요')로 쓴다.
+12. 입력이 욕설·특정인 비방·장난·통학로와 무관한 내용이면 status를 "retry"로 하고 message에 친절하게 다시 써 달라고 안내한다.
+
+[출력 형식] 설명 없이 아래 구조의 JSON 하나만 출력한다.
+{RD_SHAPE}"""
+
+
+def _join(v):
+    if isinstance(v, (list, tuple)):
+        return ", ".join(x for x in v if x) or "없음"
+    return (v or "").strip() or "없음"
+
+
+def road_user_prompt(inp, labels):
+    img_lines = "\n".join(f"- {i + 1}번째 이미지 = {lab}" + (f" (설명: {cap})" if cap else "")
+                          for i, (lab, cap) in enumerate(labels)) or "없음"
+    return f"""[학교] {_join(inp.get('school'))} (건의문에서는 〔학교〕로 표기)
+[읍·면] 합천군 {_join(inp.get('town'))}
+[정확한 위치] {_join(inp.get('spot'))}
+[구간·범위] {_join(inp.get('range'))}
+[장소 유형] {_join(inp.get('types'))}
+[지도 링크] {_join(inp.get('map'))}
+
+[위험·불편 요소] {_join(inp.get('hazards'))}
+[주로 언제] {_join(inp.get('times'))}
+[자세한 상황]
+{_join(inp.get('detail'))}
+
+[바라는 개선] {_join(inp.get('requests'))}
+[자세한 요구]
+{_join(inp.get('req_detail'))}
+
+[근거 — 이용 학생 수] {_join(inp.get('users'))}
+[근거 — 설문 결과] {_join(inp.get('survey'))}
+[근거 — 아찔했던 일·사고 사례] {_join(inp.get('incident'))}
+[학생이 고른 우선순위] {_join(inp.get('priority'))}
+
+[첨부 이미지 순서]
+{img_lines}
+
+위 내용으로 통학로 개선 추가 제안을 JSON으로 작성해 줘."""
+
+
+def normalize_road(raw):
+    raw = raw if isinstance(raw, dict) else {}
+    d = {}
+    for f in RD_TEXT:
+        v = raw.get(f, "")
+        if isinstance(v, list):
+            v = "\n".join(str(x) for x in v)
+        v = _BAD_XML_CHARS.sub("", str(v or "")).replace("\t", " ").strip()
+        if f not in ("petition", "speech"):
+            v = " ".join(x.strip() for x in v.splitlines() if x.strip())
+        d[f] = v
+    for f in RD_LIST + ["privacy_warnings", "tips"]:
+        v = raw.get(f, [])
+        if isinstance(v, str):
+            v = v.splitlines()
+        if not isinstance(v, list):
+            v = [v]
+        d[f] = [c for c in (clean_item(x) for x in v) if c]
+    if d["priority"] not in RD_PRIORITY:
+        d["priority"] = next((p for p in RD_PRIORITY if p in d["priority"]), d["priority"])
+    d["status"] = str(raw.get("status", "ok") or "ok").strip().lower()
+    d["message"] = str(raw.get("message", "") or "").strip()
+    return d
+
+
+def rd_has_content(doc):
+    return bool(doc.get("petition") or doc.get("place") or doc.get("requests"))
+
+
+def rd_tokens(text, meta):
+    return text.replace("〔학교〕", (meta.get("school") or "").strip() or "○○학교")
+
+
+def rd_placeholder_count(doc):
+    n = 0
+    for f in RD_TEXT + RD_LIST:
+        v = doc.get(f)
+        for t in (v if isinstance(v, list) else [v or ""]):
+            n += len(PLACEHOLDER_RE.findall(t))
+    return n
+
+
+def prep_image(data, max_side=1280):
+    """사진 방향을 바로잡고, 크기를 줄이고, 위치(GPS) 등 촬영 정보를 지운 JPEG로 바꾼다."""
+    try:
+        from PIL import Image, ImageOps
+        im = Image.open(io.BytesIO(data))
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        else:
+            im = im.convert("RGB")
+        im.thumbnail((max_side, max_side))
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=85)
+        return out.getvalue(), im.size
+    except Exception:
+        return None, None
+
+
+def _cached_prep(data):
+    ss = st.session_state
+    cache = ss.setdefault("rd_img_cache", {})
+    h = hashlib.sha1(data).hexdigest()
+    if h not in cache:
+        if len(cache) > 12:
+            cache.clear()
+        cache[h] = prep_image(data)
+    return cache[h]
+
+
+# ── 그림 그리기 캔버스 (Streamlit 사용자 컴포넌트: 앱이 실행될 때 임시 폴더에 index.html을 만든다)
+RD_CANVAS_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:2px;font-family:"Malgun Gothic","Apple SD Gothic Neo","Noto Sans KR",sans-serif;color:#222;background:transparent}
+.bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 6px}
+.bar .lab{font-size:12px;color:#666;margin-right:2px}
+button{border:1px solid #cfd4dc;background:#fff;color:#222;border-radius:8px;padding:5px 9px;font-size:14px;cursor:pointer;min-height:34px;font-family:inherit}
+button.on{box-shadow:0 0 0 3px #ff8a00 inset;font-weight:700}
+.sw{width:30px;height:30px;min-height:30px;border-radius:50%;padding:0;border:2px solid #fff;box-shadow:0 0 0 1px #aaa}
+.sw.on{box-shadow:0 0 0 3px #ff8a00}
+.st{font-size:20px;padding:2px 6px}
+input[type=text]{border:1px solid #cfd4dc;border-radius:8px;padding:5px 8px;font-size:14px;width:130px;min-height:34px;font-family:inherit}
+canvas{display:block;width:100%;height:auto;border:1px solid #cfd4dc;border-radius:10px;background:#fff;touch-action:none;cursor:crosshair}
+.foot{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center}
+.primary{background:#ff4b4b;color:#fff;border-color:#ff4b4b;font-weight:700}
+#msg{font-size:13px;color:#2e7d32}
+</style></head><body>
+<div class="bar" id="colors"><span class="lab">색</span></div>
+<div class="bar" id="tools"><span class="lab">도구</span></div>
+<div class="bar" id="stamps"><span class="lab">도장</span></div>
+<canvas id="c" width="1000" height="625"></canvas>
+<div class="foot">
+  <button class="primary" id="use">✅ 이 그림 제안서에 넣기</button>
+  <button id="dl">⬇️ 그림 내려받기</button>
+  <span id="msg"></span>
+</div>
+<script>
+(function(){
+var W=1000,H=625,c=document.getElementById('c'),ctx=c.getContext('2d');
+var ink=document.createElement('canvas');ink.width=W;ink.height=H;var ik=ink.getContext('2d');
+var color='#111111',size=6,tool='pen',grid=true,stamp=null,drawing=false,last=null,start=null,hist=[];
+var COLORS=[['#111111','검정'],['#e53935','빨강'],['#1e88e5','파랑'],['#43a047','초록'],['#fb8c00','주황'],['#8e24aa','보라']];
+var STAMPS=['🏫','🚸','⚠️','🚗','🚌','🚦','💡','🏠','❌','⭕'];
+var msgEl=document.getElementById('msg');
+function say(t){msgEl.textContent=t;}
+function send(type,data){var m={isStreamlitMessage:true,type:type};for(var k in (data||{}))m[k]=data[k];window.parent.postMessage(m,'*');}
+function setH(){send('streamlit:setFrameHeight',{height:Math.ceil(document.documentElement.scrollHeight)+6});}
+function btn(parent,html,title,fn,cls){var b=document.createElement('button');b.innerHTML=html;b.title=title||'';if(cls)b.className=cls;b.onclick=fn;parent.appendChild(b);return b;}
+function mark(group,b){[].forEach.call(document.querySelectorAll('[data-g="'+group+'"]'),function(x){x.classList.remove('on');});if(b)b.classList.add('on');}
+var colorsEl=document.getElementById('colors');
+COLORS.forEach(function(cv,i){var b=btn(colorsEl,'',cv[1],function(){color=cv[0];mark('col',b);if(tool==='eraser'){tool='pen';mark('tool',penB);}},'sw');b.style.background=cv[0];b.dataset.g='col';if(i===0)b.classList.add('on');});
+var toolsEl=document.getElementById('tools');
+var penB=btn(toolsEl,'✏️ 펜','자유롭게 그리기',function(){tool='pen';mark('tool',penB);});penB.dataset.g='tool';penB.classList.add('on');
+var lineB=btn(toolsEl,'📏 직선','길을 곧게 그리기',function(){tool='line';mark('tool',lineB);});lineB.dataset.g='tool';
+var erB=btn(toolsEl,'🧽 지우개','지우기',function(){tool='eraser';mark('tool',erB);});erB.dataset.g='tool';
+var txt=document.createElement('input');txt.type='text';txt.placeholder='글자 (예: 정문)';toolsEl.appendChild(txt);
+var txB=btn(toolsEl,'🔤 글자 넣기','글자를 쓰고 그림 위를 누르세요',function(){tool='text';mark('tool',txB);if(!txt.value.trim()){txt.focus();say('글자를 먼저 쓰고, 넣을 곳을 누르세요.');}});txB.dataset.g='tool';
+[[3,'가늘게'],[6,'보통'],[12,'굵게']].forEach(function(sv){var b=btn(toolsEl,sv[1],'굵기',function(){size=sv[0];mark('size',b);});b.dataset.g='size';if(sv[0]===6)b.classList.add('on');});
+btn(toolsEl,'↩️ 되돌리기','방금 한 것 취소',function(){if(hist.length){ik.putImageData(hist.pop(),0,0);render();}});
+btn(toolsEl,'🗑️ 모두 지우기','처음부터',function(){if(confirm('그림을 모두 지울까요?')){snap();ik.clearRect(0,0,W,H);render();}});
+var gB=btn(toolsEl,'▦ 모눈','모눈 켜기/끄기',function(){grid=!grid;gB.classList.toggle('on',grid);render();});gB.classList.add('on');
+var stEl=document.getElementById('stamps');
+STAMPS.forEach(function(s){var b=btn(stEl,s,'도장을 고르고 그림 위를 누르세요',function(){tool='stamp';stamp=s;mark('tool',b);say(s+' 도장을 찍을 곳을 누르세요.');},'st');b.dataset.g='tool';});
+function bg(g){g.fillStyle='#ffffff';g.fillRect(0,0,W,H);if(grid){g.strokeStyle='#e9edf3';g.lineWidth=1;for(var x=0;x<=W;x+=25){g.beginPath();g.moveTo(x+.5,0);g.lineTo(x+.5,H);g.stroke();}for(var y=0;y<=H;y+=25){g.beginPath();g.moveTo(0,y+.5);g.lineTo(W,y+.5);g.stroke();}}}
+function render(pre){ctx.clearRect(0,0,W,H);bg(ctx);ctx.drawImage(ink,0,0);if(pre)pre(ctx);}
+function pos(e){var r=c.getBoundingClientRect();return{x:(e.clientX-r.left)*W/r.width,y:(e.clientY-r.top)*H/r.height};}
+function snap(){try{hist.push(ik.getImageData(0,0,W,H));if(hist.length>25)hist.shift();}catch(err){}}
+function line(g,a,b,w,col,erase){g.save();g.lineCap='round';g.lineJoin='round';g.lineWidth=w;if(erase){g.globalCompositeOperation='destination-out';g.strokeStyle='rgba(0,0,0,1)';}else{g.strokeStyle=col;}g.beginPath();g.moveTo(a.x,a.y);g.lineTo(b.x,b.y);g.stroke();g.restore();}
+function font(px){return px+'px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","Malgun Gothic","Apple SD Gothic Neo",sans-serif';}
+c.addEventListener('pointerdown',function(e){e.preventDefault();var p=pos(e);
+  if(tool==='stamp'||tool==='text'){var t=tool==='stamp'?stamp:txt.value.trim();if(!t){say('글자를 먼저 써 주세요.');txt.focus();return;}
+    snap();ik.save();ik.fillStyle=color;ik.font=font(tool==='stamp'?size*5+34:size*2+20);ik.textAlign='center';ik.textBaseline='middle';ik.fillText(t,p.x,p.y);ik.restore();render();say('');return;}
+  try{c.setPointerCapture(e.pointerId);}catch(err){}
+  snap();drawing=true;last=p;start=p;
+  if(tool!=='line'){line(ik,p,{x:p.x+0.1,y:p.y+0.1},tool==='eraser'?size*4:size,color,tool==='eraser');render();}});
+c.addEventListener('pointermove',function(e){if(!drawing)return;var p=pos(e);
+  if(tool==='line'){render(function(g){line(g,start,p,size,color,false);});}
+  else{line(ik,last,p,tool==='eraser'?size*4:size,color,tool==='eraser');last=p;render();}});
+function end(e){if(!drawing)return;drawing=false;if(tool==='line'){line(ik,start,pos(e),size,color,false);render();}}
+c.addEventListener('pointerup',end);c.addEventListener('pointercancel',end);
+function blank(){var d=ik.getImageData(0,0,W,H).data;for(var i=3;i<d.length;i+=40){if(d[i])return false;}return true;}
+function jpeg(){var t=document.createElement('canvas');t.width=W;t.height=H;var g=t.getContext('2d');bg(g);g.drawImage(ink,0,0);return t.toDataURL('image/jpeg',0.9);}
+document.getElementById('use').onclick=function(){if(blank()){say('먼저 그림을 그려 주세요.');return;}
+  send('streamlit:setComponentValue',{value:{img:jpeg(),ts:Date.now()},dataType:'json'});say('제안서에 넣었어요! 아래에서 확인하세요.');};
+document.getElementById('dl').onclick=function(){if(blank()){say('먼저 그림을 그려 주세요.');return;}
+  var a=document.createElement('a');a.href=jpeg();a.download='통학로_그림.jpg';document.body.appendChild(a);a.click();a.remove();};
+window.addEventListener('message',function(e){if(e.data&&e.data.type==='streamlit:render'){setH();}});
+if(window.ResizeObserver){new ResizeObserver(setH).observe(document.body);}
+window.addEventListener('load',setH);
+render();send('streamlit:componentReady',{apiVersion:1});setH();
+})();
+</script></body></html>"""
+
+
+def _canvas_component():
+    folder = os.path.join(tempfile.gettempdir(), "rd_canvas_v1")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "index.html")
+    try:
+        with open(path, encoding="utf-8") as f:
+            same = f.read() == RD_CANVAS_HTML
+    except OSError:
+        same = False
+    if not same:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(RD_CANVAS_HTML)
+    return components.declare_component("rd_canvas_v1", path=folder)
+
+
+# ── 워드(.docx) 만들기 — 한글에서도 열린다
+def _dx(t):
+    return html.escape(_BAD_XML_CHARS.sub("", t or ""), quote=False)
+
+
+def _dx_runs(text, bold=False, size=None, color=None):
+    out = []
+    for is_ph, s in (split_placeholders(text) or [(False, "")]):
+        props = []
+        if bold:
+            props.append("<w:b/>")
+        col = "D60000" if is_ph else color
+        if col:
+            props.append(f'<w:color w:val="{col}"/>')
+        if size:
+            props.append(f'<w:sz w:val="{size}"/><w:szCs w:val="{size}"/>')
+        rpr = f"<w:rPr>{''.join(props)}</w:rPr>" if props else ""
+        out.append(f'<w:r>{rpr}<w:t xml:space="preserve">{_dx(s)}</w:t></w:r>')
+    return "".join(out)
+
+
+def _dp(text="", bold=False, size=None, align=None, color=None, after=None, bullet=False, runs=None, keep=False):
+    ppr = []
+    if keep:
+        ppr.append("<w:keepNext/>")
+    if align:
+        ppr.append(f'<w:jc w:val="{align}"/>')
+    if after is not None:
+        ppr.append(f'<w:spacing w:after="{after}"/>')
+    if bullet:
+        ppr.append('<w:ind w:left="240" w:hanging="240"/>')
+    body = runs if runs is not None else _dx_runs(("- " if bullet else "") + text, bold, size, color)
+    return f"<w:p>{'<w:pPr>' + ''.join(ppr) + '</w:pPr>' if ppr else ''}{body}</w:p>"
+
+
+def _dcell(width, paras, fill=None):
+    shd = f'<w:shd w:val="clear" w:color="auto" w:fill="{fill}"/>' if fill else ""
+    return (f'<w:tc><w:tcPr><w:tcW w:w="{width}" w:type="dxa"/>{shd}<w:vAlign w:val="center"/></w:tcPr>'
+            f'{"".join(paras) or "<w:p/>"}</w:tc>')
+
+
+def _dimage(rid, idx, w_px, h_px, max_cm=15.0, max_h_cm=10.0):
+    emu_cm = 360000
+    ratio = h_px / float(w_px or 1)
+    w = max_cm * emu_cm
+    h = w * ratio
+    if h > max_h_cm * emu_cm:
+        h = max_h_cm * emu_cm
+        w = h / ratio
+    w, h = int(w), int(h)
+    return (f'<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:after="40"/></w:pPr><w:r><w:drawing>'
+            f'<wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{w}" cy="{h}"/>'
+            f'<wp:docPr id="{idx}" name="그림 {idx}"/><wp:cNvGraphicFramePr>'
+            f'<a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>'
+            f'</wp:cNvGraphicFramePr><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            f'<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+            f'<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+            f'<pic:nvPicPr><pic:cNvPr id="{idx}" name="image{idx}.jpg"/><pic:cNvPicPr/></pic:nvPicPr>'
+            f'<pic:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
+            f'<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{w}" cy="{h}"/></a:xfrm>'
+            f'<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>'
+            f"</wp:inline></w:drawing></w:r></w:p>")
+
+
+def build_road_docx(doc, meta, images):
+    today = datetime.now().strftime("%Y. %m. %d.")
+    body = []
+    body.append(_dp("합천지역 통학로 개선 추가 제안서", bold=True, size=36, align="center", after=60))
+    body.append(_dp("합천학생의회 제2차 정례회 · 합천군청 [군민의소리] 추가 건의", size=20, align="center", color="555555", after=60))
+    who = " · ".join(x for x in [f"학교: {meta.get('school') or '○○학교'}",
+                                  f"제안자: {meta['name']}" if meta.get("name") else "", f"작성일: {today}"] if x)
+    body.append(_dp(who, size=20, align="center", color="555555", after=240))
+
+    body.append(_dp("1. 제안 요약", bold=True, size=26, after=100, keep=True))
+    LW, RW = 2000, 7638
+
+    def row(label, paras):
+        return f"<w:tr>{_dcell(LW, [_dp(label, bold=True, align='center')], 'EEF1F6')}{_dcell(RW, paras)}</w:tr>"
+
+    def items(lst):
+        return [_dp(x, bullet=True, after=40) for x in lst] or [_dp("")]
+
+    pr = doc.get("priority", "")
+    pr_runs = _dx_runs(pr, bold=True, color="C62828" if pr == "매우 시급" else ("EF6C00" if pr == "시급" else None))
+    if doc.get("priority_reason"):
+        pr_runs += _dx_runs("  " + doc["priority_reason"])
+    rows = [
+        row("건의 제목", [_dp(doc.get("title", ""), bold=True)]),
+        row("장소", [_dp(doc.get("place", ""))]),
+        row("위험·불편 상황", items(doc.get("situation", []))),
+        row("요구 내용", items(doc.get("requests", []))),
+        row("근거", items(doc.get("evidence", []))),
+        row("우선순위", [_dp(runs=pr_runs)]),
+    ]
+    border = "".join(f'<w:{s} w:val="single" w:sz="6" w:space="0" w:color="444444"/>'
+                     for s in ("top", "left", "bottom", "right", "insideH", "insideV"))
+    body.append(
+        f'<w:tbl><w:tblPr><w:tblW w:w="{LW + RW}" w:type="dxa"/><w:tblBorders>{border}</w:tblBorders>'
+        '<w:tblLayout w:type="fixed"/><w:tblCellMar><w:top w:w="80" w:type="dxa"/><w:left w:w="120" w:type="dxa"/>'
+        '<w:bottom w:w="80" w:type="dxa"/><w:right w:w="120" w:type="dxa"/></w:tblCellMar></w:tblPr>'
+        f'<w:tblGrid><w:gridCol w:w="{LW}"/><w:gridCol w:w="{RW}"/></w:tblGrid>{"".join(rows)}</w:tbl>')
+    body.append(_dp("", after=120))
+
+    rels, media = [], []
+    sec = 2
+    if images:
+        body.append(_dp(f"{sec}. 현장 사진·그림", bold=True, size=26, after=100, keep=True))
+        for i, im in enumerate(images, 1):
+            rid = f"rIdImg{i}"
+            rels.append(f'<Relationship Id="{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image{i}.jpg"/>')
+            media.append((f"word/media/image{i}.jpg", im["jpeg"]))
+            body.append(_dimage(rid, i, im["size"][0], im["size"][1]))
+            cap = im["label"] + (f". {im['caption']}" if im.get("caption") else "")
+            body.append(_dp(cap, size=19, align="center", color="555555", after=160))
+        if doc.get("photo_notes"):
+            body.append(_dp("사진·그림에서 확인한 내용", bold=True, size=20, after=60))
+            body += [_dp(x, bullet=True, size=20, after=40) for x in doc["photo_notes"]]
+        sec += 1
+
+    body.append(_dp(f"{sec}. 군민의소리 건의문", bold=True, size=26, after=100, keep=True))
+    for para in re.split(r"\n\s*\n", rd_tokens(doc.get("petition", ""), meta)):
+        if para.strip():
+            body.append(_dp(" ".join(para.split("\n")).strip(), after=120))
+    sec += 1
+    if doc.get("speech"):
+        body.append(_dp(f"{sec}. 정례회 자유발언 (30초)", bold=True, size=26, after=100, keep=True))
+        body.append(_dp(rd_tokens(doc["speech"], meta), after=120))
+
+    sect = ('<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+            '<w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="567" w:footer="567" w:gutter="0"/></w:sectPr>')
+    document = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+                'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
+                f'<w:body>{"".join(body)}{sect}</w:body></w:document>')
+    styles = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults>'
+              '<w:rPrDefault><w:rPr><w:rFonts w:ascii="Malgun Gothic" w:hAnsi="Malgun Gothic" w:eastAsia="맑은 고딕" w:cs="Malgun Gothic"/>'
+              '<w:sz w:val="21"/><w:szCs w:val="21"/><w:lang w:val="ko-KR" w:eastAsia="ko-KR"/></w:rPr></w:rPrDefault>'
+              '<w:pPrDefault><w:pPr><w:spacing w:after="80" w:line="300" w:lineRule="auto"/></w:pPr></w:pPrDefault>'
+              '</w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>'
+              '</w:styles>')
+    ctypes = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+              '<Default Extension="xml" ContentType="application/xml"/><Default Extension="jpg" ContentType="image/jpeg"/>'
+              '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+              '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+              '</Types>')
+    root_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                 '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                 '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+                 '</Relationships>')
+    doc_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                + "".join(rels) + "</Relationships>")
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", ctypes)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("word/document.xml", document)
+        z.writestr("word/styles.xml", styles)
+        z.writestr("word/_rels/document.xml.rels", doc_rels)
+        for name, data in media:
+            z.writestr(name, data)
+    return out.getvalue()
+
+
+def road_text_export(doc, meta, images):
+    L = ["〈합천지역 통학로 개선 추가 제안〉",
+         f"학교: {meta.get('school') or '○○학교'}" + (f" / 제안자: {meta['name']}" if meta.get("name") else ""), "",
+         f"■ 건의 제목: {doc.get('title', '')}", f"■ 장소: {doc.get('place', '')}", "■ 위험·불편 상황"]
+    L += [f"  - {x}" for x in doc.get("situation", [])]
+    L += ["■ 요구 내용"] + [f"  - {x}" for x in doc.get("requests", [])]
+    L += ["■ 근거"] + [f"  - {x}" for x in doc.get("evidence", [])]
+    L += [f"■ 우선순위: {doc.get('priority', '')} — {doc.get('priority_reason', '')}"]
+    if images:
+        L += ["■ 첨부: " + ", ".join(im["label"] + (f"({im['caption']})" if im.get("caption") else "") for im in images)]
+    L += ["", "[군민의소리 건의문]", rd_tokens(doc.get("petition", ""), meta).strip()]
+    if doc.get("speech"):
+        L += ["", "[정례회 자유발언 30초]", rd_tokens(doc["speech"], meta).strip()]
+    L += ["", "[서기용 한 줄 요약]", doc.get("summary_line", "")]
+    return "\n".join(L) + "\n"
+
+
+RD_CSS = """
+<style>
+.rd-paper .ap-t th.rd-h{width:22%;background:#eef1f6!important;font-weight:700;text-align:center}
+.rd-paper .ap-t td.rd-v{text-align:left!important;vertical-align:top;padding:8px 12px!important}
+.rd-paper ul.ap-items{margin:0 0 0 4px!important}
+.rd-badge{display:inline-block;padding:1px 10px;border-radius:999px;font-weight:800;font-size:13px;margin-right:6px;color:#fff!important}
+.rd-b1{background:#c62828!important}.rd-b2{background:#ef6c00!important}.rd-b3{background:#607d8b!important}
+.rd-title{font-family:"Malgun Gothic","맑은 고딕","Apple SD Gothic Neo",sans-serif;font-weight:800;font-size:20px;text-align:center;
+ border-top:6px solid #ffe08a;border-bottom:6px solid #ffe08a;padding:8px 6px;margin:0 0 14px;line-height:1.4}
+.rd-letter{background:#fff!important;color:#1a1a1a!important;border:1px solid #d5d5d5;border-radius:6px;padding:20px 22px;
+ max-width:780px;margin:6px auto;font-size:16px;line-height:1.9;font-family:"Malgun Gothic","맑은 고딕","Apple SD Gothic Neo",sans-serif}
+.rd-letter *{color:#1a1a1a}
+.rd-letter p{margin:0 0 12px!important}
+.rd-letter mark.ap-ph{background:#fff1a6!important;color:#8a4a00!important}
+</style>
+"""
+
+
+def render_road_card(doc, meta):
+    e = html.escape
+
+    def ul(lst):
+        if not lst:
+            return '<span class="ap-empty" style="margin:0">(비어 있음)</span>'
+        return '<ul class="ap-items">' + "".join(f"<li>{_rich(x)}</li>" for x in lst) + "</ul>"
+
+    pr = doc.get("priority", "")
+    cls = {"매우 시급": "rd-b1", "시급": "rd-b2"}.get(pr, "rd-b3")
+    badge = f'<span class="rd-badge {cls}">{e(pr)}</span>' if pr else ""
+    rows = [("건의 제목", f"<b>{_rich(doc.get('title', ''))}</b>"), ("장소", _rich(doc.get("place", ""))),
+            ("위험·불편 상황", ul(doc.get("situation"))), ("요구 내용", ul(doc.get("requests"))),
+            ("근거", ul(doc.get("evidence"))), ("우선순위", badge + _rich(doc.get("priority_reason", "")))]
+    who = e(meta.get("school") or "○○학교") + (f" · {e(meta['name'])}" if meta.get("name") else "")
+    return ('<div class="ap-paper rd-paper"><div class="ap-formno">합천지역 통학로 개선 추가 제안 '
+            f'<span style="font-weight:400;color:#666">· {who}</span></div>'
+            f'<div class="rd-title">{_rich(doc.get("title") or "(건의 제목)")}</div><table class="ap-t">'
+            + "".join(f'<tr><th class="rd-h">{e(k)}</th><td class="rd-v">{v}</td></tr>' for k, v in rows)
+            + "</table></div>")
+
+
+def render_letter(text, meta):
+    paras = [p for p in re.split(r"\n\s*\n", rd_tokens(text, meta)) if p.strip()]
+    return '<div class="rd-letter">' + "".join(
+        "<p>" + "<br>".join(_rich(x) for x in p.strip().splitlines()) + "</p>" for p in paras) + "</div>"
+
+
+def _rk(ver, f):
+    return f"rd_e{ver}_{f}"
+
+
+def current_road(doc0, ver):
+    ss = st.session_state
+    d = dict(doc0)
+    for f in RD_TEXT:
+        if _rk(ver, f) in ss:
+            v = str(ss[_rk(ver, f)])
+            d[f] = v.strip() if f in ("petition", "speech") else " ".join(x.strip() for x in v.splitlines() if x.strip())
+    for f in RD_LIST:
+        if _rk(ver, f) in ss:
+            d[f] = [c for c in (clean_item(x) for x in str(ss[_rk(ver, f)]).splitlines()) if c]
+    return d
+
+
+def rd_fill_example():
+    for k, v in RD_EXAMPLE.items():
+        st.session_state[k] = v
+
+
+def collect_images():
+    """현재 올린 사진(최대 3장)과 그림을 [{label, caption, jpeg, size}] 로 모은다."""
+    ss = st.session_state
+    imgs = []
+    files = ss.get("rd_photos") or []
+    for i, f in enumerate(list(files)[:RD_MAX_PHOTOS]):
+        try:
+            data = f.getvalue()
+        except Exception:
+            continue
+        jpeg, size = _cached_prep(data)
+        if jpeg:
+            imgs.append({"label": f"사진 {i + 1}", "caption": (ss.get(f"rd_cap_p{i}") or "").strip(),
+                         "jpeg": jpeg, "size": size})
+    if ss.get("rd_drawing"):
+        jpeg, size = ss.rd_drawing
+        imgs.append({"label": "그림 1 (학생이 그린 약도)", "caption": (ss.get("rd_cap_d") or "").strip(),
+                     "jpeg": jpeg, "size": size})
+    return imgs
+
+
+def road_editor(doc0, ver):
+    st.caption("한 줄에 한 항목씩 써요. 고친 내용은 제안 카드·건의문·내려받는 파일에 바로 반영돼요.")
+    st.text_input("건의 제목", value=doc0.get("title", ""), key=_rk(ver, "title"))
+    st.text_input("장소", value=doc0.get("place", ""), key=_rk(ver, "place"))
+    for label, f in (("위험·불편 상황", "situation"), ("요구 내용", "requests"), ("근거", "evidence")):
+        items = doc0.get(f, [])
+        st.text_area(label, value="\n".join(items), key=_rk(ver, f), height=max(100, min(260, 34 * len(items) + 60)))
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        st.text_input("우선순위", value=doc0.get("priority", ""), key=_rk(ver, "priority"))
+    with c2:
+        st.text_input("우선순위 이유", value=doc0.get("priority_reason", ""), key=_rk(ver, "priority_reason"))
+    st.text_area("군민의소리 건의문 (단락 사이는 한 줄 띄우기)", value=doc0.get("petition", ""),
+                 key=_rk(ver, "petition"), height=320)
+    st.text_area("정례회 자유발언 (30초)", value=doc0.get("speech", ""), key=_rk(ver, "speech"), height=110)
+    st.text_input("서기용 한 줄 요약", value=doc0.get("summary_line", ""), key=_rk(ver, "summary_line"))
+
+
+def road_page():
+    st.markdown(CSS + RD_CSS, unsafe_allow_html=True)
+    ss = st.session_state
+    for k, v in (("rd_doc", None), ("rd_ver", 0), ("rd_inputs", None), ("rd_flash", None),
+                 ("rd_drawing", None), ("rd_draw_ts", None), ("ap_calls", 0)):
+        if k not in ss:
+            ss[k] = v
+
+    st.title("🚸 통학로 개선 추가 제안 만들기")
+    st.caption("합천학생의회 제2차 정례회 · 합천군청 [군민의소리] 추가 건의")
+    st.info("**군청의 답변:** “통학로 개선에 관해 구체적인 장소 및 요구 내용을 추가로 올려 주면 고려하겠다.”\n\n"
+            "그래서 이번 제안은 **어디가 · 어떻게 불편하고 · 무엇을 바꿔 달라는지**가 분명해야 해요. "
+            "아래 칸을 채우고 현장 사진이나 그림을 올리면, AI가 사진까지 살펴보고 건의문으로 정리해 줘요.")
+    with st.expander("처음이라면 읽어 보세요 · 사용 방법과 안전 수칙"):
+        st.markdown(
+            "1. **장소 → 불편한 점 → 바라는 개선** 순서로 써요. 정확할수록 군청이 검토하기 쉬워요.\n"
+            "2. **현장 사진**을 올리거나, **✏️ 그림 그리기**로 길과 위험한 곳을 약도처럼 그려요. 종이에 그린 그림을 사진으로 찍어 올려도 돼요.\n"
+            "3. **✨ AI로 건의문 만들기**를 누르면 제안 카드, 군민의소리 건의문, 정례회 30초 발언이 만들어져요.\n"
+            "4. 읽어 보고 고친 뒤 **워드 파일(한글에서도 열려요)** 로 내려받아 제출해요.\n\n"
+            "⚠️ **안전 수칙**\n"
+            "- 현장 사진은 반드시 **보호자나 선생님과 함께**, 차가 다니지 않는 안전한 곳에서 찍어요.\n"
+            "- **사람 얼굴, 자동차 번호판, 집 주소**가 나오지 않게 찍어요. 나왔다면 AI가 알려 줘요.\n"
+            "- 사진 속 위치(GPS) 같은 촬영 정보는 이 앱이 자동으로 지워요.\n"
+            "- AI는 숫자를 지어내지 않아요. 노란색 **【 】 빈칸**은 직접 조사해서 채워요.")
+    st.button("💡 예시로 채워 보기", on_click=rd_fill_example, key="rd_example_btn",
+              help="합천읍 통학로 예시가 채워져요. 우리 학교 내용으로 바꿔 쓰면 돼요.")
+
+    st.subheader("1. 제안하는 사람")
+    c1, c2 = st.columns(2)
+    with c1:
+        school = st.text_input("학교", key="rd_in_school", max_chars=40, placeholder="예: 합천○○초등학교")
+    with c2:
+        name = st.text_input("제안자 (모둠·이름)", key="rd_in_name", max_chars=40, placeholder="예: 3모둠 홍길동 외 2명")
+
+    st.subheader("2. 📍 어디인가요? (장소) *")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        town = st.selectbox("읍·면", HAPCHEON_TOWNS, index=None, placeholder="선택", key="rd_in_town")
+    with c2:
+        spot = st.text_input("정확한 위치 *", key="rd_in_spot", max_chars=100,
+                             placeholder="예: ○○초 정문 앞 ○○삼거리 횡단보도")
+    rng = st.text_input("구간·범위 (길이 단위 문제라면)", key="rd_in_range", max_chars=100,
+                        placeholder="예: ○○중 후문 ~ ○○마을 입구 약 300m")
+    types = st.multiselect("어떤 곳인가요? (여러 개 골라도 돼요)", RD_PLACE_TYPES, key="rd_in_types")
+    map_link = st.text_input("지도 링크 (선택 · 네이버/카카오 지도에서 '공유' → 링크 복사)", key="rd_in_map", max_chars=300)
+
+    st.subheader("3. ⚠️ 무엇이 위험하거나 불편한가요? *")
+    hazards = st.multiselect("해당하는 것을 모두 골라요", RD_HAZARDS, key="rd_in_hazards")
+    times = st.multiselect("주로 언제 그런가요?", RD_TIMES, key="rd_in_times")
+    detail = st.text_area("자세한 상황 *", key="rd_in_detail", height=130, max_chars=1200,
+                          placeholder="어떤 일이 있었나요? 아찔했던 경험, 불편한 점을 내 말로 편하게 써요.\n"
+                                      "예: 인도가 없어서 차도 가장자리로 걸어요. 아침에 차가 많이 몰려서 무서워요.")
+
+    st.subheader("4. 🙋 무엇을 바꿔 달라고 할까요? (개선 요구) *")
+    reqs = st.multiselect("바라는 개선을 골라요", RD_REQUESTS, key="rd_in_requests")
+    req_detail = st.text_area("자세한 요구 (어디에 무엇을)", key="rd_in_req_detail", height=90, max_chars=800,
+                              placeholder="예: 삼거리 횡단보도 앞에 옐로카펫과 과속방지턱을 설치해 주세요.")
+
+    st.subheader("5. 📸 현장 사진 · 그림 (권장)")
+    st.caption("⚠️ 사진은 보호자나 선생님과 함께 안전하게 찍고, 얼굴·차량 번호가 나오지 않게 해 주세요. 위치(GPS) 정보는 자동으로 지워져요.")
+    tab_p, tab_d = st.tabs(["📷 사진 올리기", "✏️ 그림 그리기"])
+    with tab_p:
+        files = st.file_uploader(f"사진을 골라요 (최대 {RD_MAX_PHOTOS}장 · 휴대폰에서는 바로 촬영도 돼요)",
+                                 type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True, key="rd_photos")
+        files = list(files or [])
+        if len(files) > RD_MAX_PHOTOS:
+            st.warning(f"사진은 {RD_MAX_PHOTOS}장까지만 써요. 앞의 {RD_MAX_PHOTOS}장만 제안서에 들어가요.")
+        if files:
+            cols = st.columns(min(len(files), RD_MAX_PHOTOS))
+            for i, f in enumerate(files[:RD_MAX_PHOTOS]):
+                with cols[i]:
+                    jpeg, _ = _cached_prep(f.getvalue())
+                    if jpeg:
+                        st.image(jpeg, caption=f"사진 {i + 1}")
+                        st.text_input(f"사진 {i + 1} 설명", key=f"rd_cap_p{i}", max_chars=60,
+                                      placeholder="예: 정문 앞 삼거리, 등교 시간")
+                    else:
+                        st.error("이 사진은 열 수 없어요. 다른 사진을 골라 주세요.")
+    with tab_d:
+        st.caption("길·학교·위험한 곳을 간단한 약도처럼 그려 보세요. 📏 직선으로 길을 긋고, 도장(🏫 ⚠️ 🚗)과 글자를 넣을 수 있어요. "
+                   "다 그리면 **✅ 이 그림 제안서에 넣기**를 누르세요.")
+        try:
+            val = _canvas_component()(key="rd_canvas", default=None)
+        except Exception:
+            val = None
+            st.info("이 기기에서는 그림 그리기를 쓸 수 없어요. 종이에 그린 뒤 사진으로 찍어 '📷 사진 올리기'에 올려 주세요.")
+        if isinstance(val, dict) and val.get("img") and val.get("ts") != ss.rd_draw_ts:
+            try:
+                raw = base64.b64decode(val["img"].split(",", 1)[1])
+                jpeg, size = prep_image(raw, max_side=1000)
+                if jpeg:
+                    ss.rd_drawing, ss.rd_draw_ts = (jpeg, size), val.get("ts")
+            except Exception:
+                st.error("그림을 가져오지 못했어요. '그림 내려받기'로 저장한 뒤 사진 올리기로 올려 주세요.")
+        if ss.rd_drawing:
+            st.success("이 그림이 제안서에 들어가요.")
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                st.image(ss.rd_drawing[0], caption="그림 1 (학생이 그린 약도)")
+            with c2:
+                st.text_input("그림 설명", key="rd_cap_d", max_chars=60, placeholder="예: 정문~마을 입구 약도")
+                if st.button("그림 빼기", key="rd_draw_remove"):
+                    ss.rd_drawing = None
+                    st.rerun()
+
+    st.subheader("6. 📊 근거 자료와 우선순위")
+    c1, c2 = st.columns(2)
+    with c1:
+        users = st.text_input("이 길을 이용하는 학생 수 (대략)", key="rd_in_users", max_chars=60, placeholder="예: 약 40명")
+    with c2:
+        priority = st.radio("얼마나 시급한가요?", RD_PRIORITY, index=1, horizontal=True, key="rd_in_priority")
+    survey = st.text_area("설문 결과 (했다면)", key="rd_in_survey", height=70, max_chars=600,
+                          placeholder="예: 5~6학년 32명 중 25명이 '등굣길이 위험하다'고 답함")
+    incident = st.text_area("아찔했던 일·사고 사례 (있다면)", key="rd_in_incident", height=70, max_chars=600)
+
+    st.subheader("7. AI로 건의문 만들기")
+    images = collect_images()
+    if images:
+        st.caption("함께 보낼 이미지: " + ", ".join(im["label"] for im in images) + " — AI가 사진·그림도 살펴봐요.")
+    if st.button("✨ AI로 건의문 만들기", type="primary", key="rd_go"):
+        problems = []
+        if len((spot or "").strip()) < 4:
+            problems.append("정확한 위치")
+        if len((detail or "").strip()) < 10:
+            problems.append("자세한 상황(10자 이상)")
+        if not reqs and len((req_detail or "").strip()) < 4:
+            problems.append("개선 요구")
+        if problems:
+            st.warning("먼저 " + ", ".join(problems) + "을(를) 써 주세요.")
+        elif ss.ap_calls >= MAX_CALLS_PER_SESSION:
+            st.error("오늘은 AI를 너무 많이 썼어요. 만든 제안을 직접 고쳐서 마무리해 주세요.")
+        else:
+            inputs = {"school": school, "town": town, "spot": spot, "range": rng, "types": types, "map": map_link,
+                      "hazards": hazards, "times": times, "detail": detail, "requests": reqs,
+                      "req_detail": req_detail, "users": users, "survey": survey, "incident": incident,
+                      "priority": priority}
+            raw = None
+            with st.spinner("AI가 사진과 내용을 살펴보고 건의문을 쓰고 있어요… (보통 15~60초)"):
+                try:
+                    raw, prov, model = ask_ai(road_system_prompt(),
+                                              road_user_prompt(inputs, [(im["label"], im["caption"]) for im in images]),
+                                              images=[("image/jpeg", im["jpeg"]) for im in images])
+                except AIError as e:
+                    show_ai_error(e)
+            if raw is not None:
+                ss.ap_calls += 1
+                doc = normalize_road(raw)
+                if doc["status"] == "retry":
+                    st.warning(doc["message"] or "내용을 조금 더 구체적으로 써 주세요.")
+                elif not rd_has_content(doc):
+                    st.error("AI 답변이 비어 있어요. 다시 한 번 눌러 주세요.")
+                else:
+                    if not doc.get("priority"):
+                        doc["priority"] = priority
+                    ss.rd_doc, ss.rd_inputs, ss.ap_engine = doc, inputs, f"{prov} · {model}"
+                    ss.rd_ver += 1
+                    ss.rd_flash = "통학로 개선 제안이 만들어졌어요! 아래에서 읽어 보고 고쳐 보세요."
+
+    doc0 = ss.rd_doc
+    if not doc0:
+        return
+    st.divider()
+    st.subheader("8. 확인하고 고치기")
+    if ss.rd_flash:
+        st.success(ss.rd_flash)
+        ss.rd_flash = None
+    ver = ss.rd_ver
+    doc = current_road(doc0, ver)
+    meta = {"school": (school or "").strip(), "name": (name or "").strip()}
+    if doc0.get("privacy_warnings"):
+        st.error("**🔒 사진에 개인정보가 보일 수 있어요.** 해당 사진을 빼거나 다시 찍어서 올려 주세요.\n\n"
+                 + "\n".join(f"- {w}" for w in doc0["privacy_warnings"]))
+    if doc0.get("tips"):
+        st.info("**🤖 AI의 조언**\n\n" + "\n".join(f"- {t}" for t in doc0["tips"]))
+    n_ph = rd_placeholder_count(doc)
+    if n_ph:
+        st.warning(f"노란색 【 】 빈칸이 **{n_ph}곳** 있어요. 직접 조사한 내용으로 채워 주세요. ('✏️ 직접 고치기' 탭)")
+
+    t1, t2, t3, t4 = st.tabs(["📋 제안 카드", "✉️ 군민의소리 건의문", "🎤 정례회 발언(30초)", "✏️ 직접 고치기"])
+    with t1:
+        st.markdown(render_road_card(doc, meta), unsafe_allow_html=True)
+        if images:
+            cols = st.columns(min(len(images), 4))
+            for i, im in enumerate(images):
+                with cols[i % len(cols)]:
+                    st.image(im["jpeg"], caption=im["label"] + (f" · {im['caption']}" if im["caption"] else ""))
+        if doc.get("photo_notes"):
+            st.markdown("**🔍 AI가 사진·그림에서 확인한 내용** (맞는지 꼭 확인하세요)")
+            st.markdown("\n".join(f"- {x}" for x in doc["photo_notes"]))
+    with t2:
+        st.caption("의장단이 합천군청 누리집 [군민의소리]에 올릴 글이에요. 아래 회색 칸 오른쪽 위 복사 단추로 복사할 수 있어요.")
+        st.markdown(render_letter(doc.get("petition", ""), meta), unsafe_allow_html=True)
+        try:
+            st.code(rd_tokens(doc.get("petition", ""), meta), language=None, wrap_lines=True)
+        except TypeError:
+            st.code(rd_tokens(doc.get("petition", ""), meta), language=None)
+    with t3:
+        st.caption("정례회 자유발언 시간에 손을 들고 말할 내용이에요.")
+        st.markdown(render_letter(doc.get("speech", ""), meta), unsafe_allow_html=True)
+    with t4:
+        road_editor(doc0, ver)
+
+    st.subheader("9. 내려받기")
+    base = safe_filename("통학로_개선_제안", meta["school"], meta["name"])
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button("⬇️ 워드 파일(.docx) 내려받기", data=build_road_docx(doc, meta, images),
+                           file_name=base + ".docx", type="primary", key="rd_dl_docx",
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    with d2:
+        st.download_button("⬇️ 텍스트(.txt) 내려받기", data=road_text_export(doc, meta, images).encode("utf-8"),
+                           file_name=base + ".txt", mime="text/plain", key="rd_dl_txt")
+    st.caption("워드 파일은 한글 프로그램에서도 열려요. 사진·그림이 함께 들어가요.")
+    st.markdown("**🗂️ 서기용 한 줄 요약** — 모둠 제안을 '통학로 개선 추가 제안 목록'으로 모을 때 복사해서 쓰세요.")
+    try:
+        st.code(doc.get("summary_line", ""), language=None, wrap_lines=True)
+    except TypeError:
+        st.code(doc.get("summary_line", ""), language=None)
+
+
+# ═════════════════════════════════════════════════════════════
+# 앱 시작 — 두 도구를 한 앱의 두 페이지로 묶는다
+#   · 통학로 개선 제안: https://(앱 주소).streamlit.app/   (첫 화면, /road 도 같은 페이지)
+#   · 안건제안서:      https://(앱 주소).streamlit.app/proposal
+# ═════════════════════════════════════════════════════════════
+def run():
+    try:
+        st.set_page_config(page_title="학생의회 AI 도우미", page_icon="📝", layout="centered")
+    except Exception:
+        pass
+    if hasattr(st, "navigation") and hasattr(st, "Page"):
+        nav = st.navigation([
+            st.Page(road_page, title="① 통학로 개선 제안", icon="🚸", url_path="road", default=True),
+            st.Page(proposal_page, title="② 안건제안서 만들기", icon="📝", url_path="proposal"),
+        ])
+        nav.run()
+    else:
+        choice = st.sidebar.radio("도구 고르기", ["🚸 통학로 개선 제안", "📝 안건제안서 만들기"])
+        (road_page if choice.startswith("🚸") else proposal_page)()
 
 
 # 원본 양식(〈서식 2〉 안건제안서.hwpx)을 그대로 담아 둔 데이터 — 수정하지 마세요.
@@ -1695,4 +2536,4 @@ TEMPLATE_B64 = (
     "FQAAAAAAAAAAACAAgIFNogAATUVUQS1JTkYvbWFuaWZlc3QueG1sUEsFBgAAAAALAAsAvQIAAPGiAAAAAA=="
 )
 
-main()
+run()
